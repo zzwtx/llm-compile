@@ -1,0 +1,14 @@
+# Ignore Tensorrt LLM example outputs and large model artifacts
+tensorrt-llm-examples/
+
+# Ignore all model directories and files that may contain built engines or weights
+models/
+
+# Ignore any file or directory with 'test' in the name (case-insensitive via common patterns)
+*test*
+*Test*
+*TEST*
+
+# Local environment / virtualenv
+myenv/
+
