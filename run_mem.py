@@ -7,7 +7,7 @@ and records per-GPU min/max/peak values relative to a baseline sampled before ru
 commands. Results are printed and written to `--out` (JSON).
 
 Usage (defaults shown):
-    python3 build_mem.py \
+    python3 run_mem.py \
       --gpus 0 1 \
       --interval 0.5 \
       --out build_mem_results.json
