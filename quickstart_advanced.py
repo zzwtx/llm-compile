@@ -108,6 +108,18 @@ def add_llm_args(parser):
                         default=False,
                         action='store_true',
                         help='Use piecewise CUDA graph to optimize the model')
+    parser.add_argument('--experiment_mode',
+                        default=False,
+                        action='store_true',
+                        help='Run the built-in warmup/test experiment against ten images.')
+    parser.add_argument('--experiment_warmup_iters',
+                        type=int,
+                        default=3,
+                        help='Number of warmup iterations for the experiment.')
+    parser.add_argument('--experiment_iterations',
+                        type=int,
+                        default=10,
+                        help='Number of timed iterations for the experiment.')
 
     # Sampling
     parser.add_argument("--max_tokens", type=int, default=64)

@@ -1,6 +1,11 @@
 import argparse
 import json
 import os
+import time
+
+import numpy as np
+from tensorrt_llm import logger
+from tensorrt_llm import mpi_rank
 
 from quickstart_advanced import add_llm_args, setup_llm
 
@@ -10,14 +15,14 @@ from tensorrt_llm.inputs import (ALL_SUPPORTED_MULTIMODAL_MODELS,
 example_medias_and_prompts = {
     "image": {
         "media": [
-            "https://huggingface.co/datasets/YiYiXu/testing-images/resolve/main/seashore.png",
-            "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/diffusers/inpaint.png",
-            "https://huggingface.co/datasets/Sayali9141/traffic_signal_images/resolve/main/61.jpg",
+            "/home/xsf/fl/edge/images/ILSVRC2012_val_00000001.JPEG",
+            "/home/xsf/fl/edge/images/ILSVRC2012_val_00000003.JPEG",
+            "/home/xsf/fl/edge/images/ILSVRC2012_val_00000002.JPEG",
         ],
         "prompt": [
             "Describe the natural environment in the image.",
             "Describe the object and the weather condition in the image.",
-            "Describe the traffic condition on the road in the image.",
+            "Describe the action in the picture.",
         ]
     },
     "video": {
@@ -77,6 +82,17 @@ example_medias_and_prompts = {
     },
 }
 
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+EXPERIMENT_IMAGE_DIR = os.path.join(SCRIPT_DIR, "images")
+EXPERIMENT_IMAGE_FILES = [
+    os.path.join(EXPERIMENT_IMAGE_DIR,
+                 f"ILSVRC2012_val_{i:08d}.JPEG")
+    for i in range(1, 11)
+]
+EXPERIMENT_PROMPTS = [
+    f"Question: Describe this image. Answer:" for i in range(len(EXPERIMENT_IMAGE_FILES))
+]
+
 
 def add_multimodal_args(parser):
     parser.add_argument("--model_type",
@@ -132,6 +148,176 @@ def add_lora_args(parser):
     return parser
 
 
+def _make_lora_request(model_class, args, llm, input_count):
+    if not args.load_lora:
+        return None
+    if model_class is None:
+        raise RuntimeError("LoRA was requested but the model class could not be loaded.")
+    return model_class.lora_request(input_count, args.modality, llm._hf_model_dir)
+
+
+def _build_multimodal_inputs(llm, args, model_type, prompt, media):
+    return default_multimodal_input_loader(
+        tokenizer=llm.tokenizer,
+        model_dir=llm._hf_model_dir,
+        model_type=model_type,
+        modality=args.modality,
+        prompts=[prompt],
+        media=[media],
+        image_data_format=args.image_format,
+        num_frames=args.num_frames,
+        device=args.device,
+    )
+
+
+def _run_iteration(llm, sampling_params, args, model_type, prompt, media, model_class):
+    start_time = time.perf_counter()
+    inputs = _build_multimodal_inputs(llm, args, model_type, prompt, media)
+    lora_request = _make_lora_request(model_class, args, llm, len(inputs))
+
+    llm_start_time = time.perf_counter()
+    streaming_result = llm.generate_async(inputs[0],
+                                          sampling_params,
+                                          lora_request=lora_request,
+                                          streaming=True)
+
+    chunk_count = 0
+    first_token_time = None
+    last_chunk = None
+
+    for _ in streaming_result:
+        chunk_count += 1
+        chunk = streaming_result.outputs[0]
+        if first_token_time is None and chunk.token_ids_diff:
+            first_token_time = time.perf_counter()
+        last_chunk = chunk
+
+    llm_end_time = time.perf_counter()
+    total_time = llm_end_time - start_time
+
+    if last_chunk is None and streaming_result.outputs:
+        last_chunk = streaming_result.outputs[0]
+
+    text = last_chunk.text if last_chunk is not None else ""
+    token_ids = list(last_chunk.token_ids) if last_chunk is not None else []
+    tok_count = len(token_ids)
+
+    streaming_metrics = {
+        "llm_start_time": llm_start_time,
+        "llm_end_time": llm_end_time,
+        "first_token_time": first_token_time,
+        "chunk_count": chunk_count,
+    }
+    setattr(llm, "last_streaming_metrics", streaming_metrics)
+
+    llm_elapsed = max(llm_end_time - llm_start_time, 0.0)
+    # ttft_value = first_token_time - start_time
+    if first_token_time is not None:
+        ttft_value = max(first_token_time - start_time, 0.0)
+
+    throughput = tok_count / max(llm_elapsed, 1e-9) if tok_count > 0 else 0.0
+    metrics = {
+        "total": total_time,
+        "llm": llm_elapsed,
+        "ttft": ttft_value,
+        "tokens": tok_count,
+        "throughput": throughput,
+        "prompt": prompt,
+        "media": media,
+        "text": text,
+        "streaming_metrics": streaming_metrics,
+    }
+    outputs = [streaming_result]
+    return outputs, metrics
+
+
+def _log_experiment_summary(records):
+    if mpi_rank() != 0:
+        return
+
+    if not records:
+        logger.info("No experiment records to summarize.")
+        return
+
+    def stats(values):
+        arr = np.array(values, dtype=float)
+        return float(np.mean(arr)), float(np.median(arr)), float(np.var(arr))
+
+    total_secs = [r["total"] for r in records]
+    llm_secs = [r["llm"] for r in records]
+    ttft_vals = [r["ttft"] for r in records]
+    throughput_vals = [r["throughput"] for r in records]
+
+    total_mean, total_med, total_var = stats(total_secs)
+    ttft_mean, ttft_med, ttft_var = stats(ttft_vals)
+    thr_mean, thr_med, thr_var = stats(throughput_vals)
+    llm_mean, llm_med, llm_var = stats(llm_secs)
+
+    logger.info('=== Experiment summary across %d iterations ===' % len(records))
+    logger.info('TTFT (s) - \nmean: %.4fs, median: %.4fs, var: %.6f' % (ttft_mean, ttft_med, ttft_var))
+    logger.info('Output Throughput (tokens/s) - \nmean: %.2f, median: %.2f, var: %.4f' % (thr_mean, thr_med, thr_var))
+    logger.info('Total Latency (s) - \nmean: %.4fs, median: %.4fs, var: %.6f' % (total_mean, total_med, total_var))
+    logger.info('LLM generate (s) - \nmean: %.4fs, median: %.4fs, var: %.6f' % (llm_mean, llm_med, llm_var))
+    logger.info('Vision encoder (s) - not instrumented in this script')
+
+
+def run_experiment(llm, sampling_params, args, model_class, model_type):
+    if mpi_rank() == 0:
+        if args.modality != "image":
+            logger.warning("Experiment mode is best suited for the image modality; overriding to 'image'.")
+            args.modality = "image"
+
+        if not EXPERIMENT_IMAGE_FILES:
+            raise RuntimeError("No experiment images were found.")
+
+        num_warmup = args.experiment_warmup_iters
+        num_iters = args.experiment_iterations
+        logger.info(
+            f"Running experiment: warmup={num_warmup}, iterations={num_iters}, image count={len(EXPERIMENT_IMAGE_FILES)}"
+        )
+
+    for warmup_idx in range(num_warmup):
+        image_idx = warmup_idx % len(EXPERIMENT_IMAGE_FILES)
+        _, warmup_metrics = _run_iteration(
+            llm,
+            sampling_params,
+            args,
+            model_type,
+            EXPERIMENT_PROMPTS[image_idx],
+            EXPERIMENT_IMAGE_FILES[image_idx],
+            model_class,
+        )
+        if mpi_rank() == 0:
+            logger.info(
+                f"[Warmup {warmup_idx + 1}/{num_warmup}] prompt={warmup_metrics['prompt']!r},"
+                f" tokens={warmup_metrics['tokens']}, total={warmup_metrics['total']:.3f}s"
+            )
+
+    records = []
+    for test_idx in range(num_iters):
+        image_idx = test_idx % len(EXPERIMENT_IMAGE_FILES)
+        outputs, metrics = _run_iteration(
+            llm,
+            sampling_params,
+            args,
+            model_type,
+            EXPERIMENT_PROMPTS[image_idx],
+            EXPERIMENT_IMAGE_FILES[image_idx],
+            model_class,
+        )
+        if mpi_rank() == 0:
+            records.append(metrics)
+            logger.info(
+                f"[Test {test_idx + 1}/{num_iters}] prompt={metrics['prompt']!r},"
+                f" tokens={metrics['tokens']}, total={metrics['total']:.3f}s,"
+                f" throughput={metrics['throughput']:.2f} tok/s"
+            )
+            if metrics['text']:
+                logger.info(f"Generated text: {metrics['text']!r}")
+
+    _log_experiment_summary(records)
+
+
 def parse_arguments():
     parser = argparse.ArgumentParser(
         description="Multimodal models with the PyTorch workflow.")
@@ -148,8 +334,17 @@ def parse_arguments():
 
 
 def main():
-    args = parse_arguments()
+    if mpi_rank() != 0:
+        # All subsequent logic is only for rank 0
+        # The LLM engine will be initialized in each rank, but the main loop
+        # should only be in rank 0.
+        # The other ranks will be in a waiting state.
+        return
 
+    args = parse_arguments()
+    logger.set_level('info')
+
+    model_class = None
     lora_config = None
     if args.load_lora:
         assert args.auto_model_name is not None, "Please provide the auto model name to load LoRA config."
@@ -170,6 +365,10 @@ def main():
         model_type = json.load(
             open(os.path.join(llm._hf_model_dir, 'config.json')))['model_type']
     assert model_type in ALL_SUPPORTED_MULTIMODAL_MODELS, f"Unsupported model_type: {model_type}"
+
+    if args.experiment_mode:
+        run_experiment(llm, sampling_params, args, model_class, model_type)
+        return
 
     # If multiturn mode is enabled
     if args.multiturn:
@@ -201,14 +400,7 @@ def main():
                     num_frames=8,
                     device="cpu")
 
-                lora_request = None
-                if args.load_lora:
-                    if model_class is None:
-                        raise ValueError(
-                            "model_class must be provided when load_lora is True"
-                        )
-                    lora_request = model_class.lora_request(
-                        len(inputs), args.modality, llm._hf_model_dir)
+                lora_request = _make_lora_request(model_class, args, llm, len(inputs))
 
                 # Generate response
                 outputs = llm.generate(inputs,
@@ -262,8 +454,7 @@ def main():
 
     lora_request = None
     if args.load_lora:
-        lora_request = model_class.lora_request(len(inputs), args.modality,
-                                                llm._hf_model_dir)
+        lora_request = _make_lora_request(model_class, args, llm, len(inputs))
 
     outputs = llm.generate(
         inputs,
