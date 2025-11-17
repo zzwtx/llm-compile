@@ -1,0 +1,26 @@
+[11/16/2025-05:09:58] [TRT-LLM] [I] TTFT (s) - 
+mean: 0.0495s, median: 0.0496s, var: 0.000000
+[11/16/2025-05:09:58] [TRT-LLM] [I] Output Throughput (tokens/s) - 
+mean: 208.55, median: 208.64, var: 0.0278
+[11/16/2025-05:09:58] [TRT-LLM] [I] Total Latency (s) - 
+mean: 0.4503s, median: 0.4659s, var: 0.002454
+[11/16/2025-05:09:58] [TRT-LLM] [I] Vision encoder (s) - 
+mean: 0.0271s, median: 0.0271s, var: 0.000000
+[11/16/2025-05:09:58] [TRT-LLM] [I] LLM generate (s) - 
+mean: 0.3667s, median: 0.3820s, var: 0.002355
+[11/16/2025-05:09:58] [TRT-LLM] [I] Tokenizer decode (s) - 
+mean: 0.0366s, median: 0.0364s, var: 0.000002
+
+
+[11/16/2025-05:11:13] [TRT-LLM] [I] TTFT (s) - 
+mean: 0.0505s, median: 0.0504s, var: 0.000000
+[11/16/2025-05:11:13] [TRT-LLM] [I] Output Throughput (tokens/s) - 
+mean: 208.44, median: 208.43, var: 0.0358
+[11/16/2025-05:11:13] [TRT-LLM] [I] Total Latency (s) - 
+mean: 0.4536s, median: 0.4584s, var: 0.002037
+[11/16/2025-05:11:13] [TRT-LLM] [I] Vision encoder (s) - 
+mean: 0.0279s, median: 0.0279s, var: 0.000000
+[11/16/2025-05:11:13] [TRT-LLM] [I] LLM generate (s) - 
+mean: 0.3703s, median: 0.3832s, var: 0.002096
+[11/16/2025-05:11:13] [TRT-LLM] [I] Tokenizer decode (s) - 
+mean: 0.0345s, median: 0.0359s, var: 0.000031

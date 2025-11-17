@@ -4,7 +4,7 @@ tensorrt-llm-examples/
 # Ignore all model directories and files that may contain built engines or weights
 models/
 
-__pycache__
+__pycache__/
 
 # Ignore any file or directory with 'test' in the name (case-insensitive via common patterns)
 *test*
@@ -14,3 +14,10 @@ __pycache__
 # Local environment / virtualenv
 myenv/
 
+_pytorch/
+
+# Allow tracking the specific Qwen2 model directory even though 'models/' is ignored
+!models/Qwen2-VL-2B-Instruct/
+!models/Qwen2-VL-2B-Instruct/**
+
+onnx_origin/

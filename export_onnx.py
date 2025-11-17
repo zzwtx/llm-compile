@@ -11,11 +11,10 @@ import argparse
 
 # isort: off
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 import tensorrt as trt
 from pathlib import Path
-from tensorrt_llm._utils import torch_dtype_to_str, to_json_file
-from tensorrt_llm.builder import Builder
-from tensorrt_llm.logger import logger
 from transformers import (AutoConfig, AutoModel, AutoModelForCausalLM,
                           AutoModelForVision2Seq, AutoProcessor,
                           Blip2ForConditionalGeneration, Blip2Processor,
@@ -24,13 +23,9 @@ from transformers import (AutoConfig, AutoModel, AutoModelForCausalLM,
                           Pix2StructForConditionalGeneration,
                           VisionEncoderDecoderModel, CLIPVisionModel)
 # isort: on
-import torch.nn as nn
-import torch.nn.functional as F
 from PIL import Image
 from safetensors.torch import save_file
 from transformers import CLIPImageProcessor
-
-from tensorrt_llm.runtime.session import Session
 
 def export_onnx(model,
                 input,
@@ -57,11 +52,11 @@ def export_onnx(model,
     )
 
     torch.onnx.export(**export_kwargs)
-    
+
+
 def compute_rotary_pos_emb(grid_thw, hf_config, VisionRotaryEmbedding):
     head_dim = hf_config.vision_config.embed_dim // hf_config.vision_config.num_heads
     rotary_pos_emb_func = VisionRotaryEmbedding(head_dim // 2)
-    hf_config.vision_config.spatial_merge_size
 
     def rot_pos_emb(grid_thw, rotary_pos_emb_func):
         pos_ids = []
@@ -95,7 +90,7 @@ def compute_rotary_pos_emb(grid_thw, hf_config, VisionRotaryEmbedding):
 
     rotary_pos_emb = rot_pos_emb(grid_thw, rotary_pos_emb_func)
     return rotary_pos_emb
-
+    
 def build_qwen2_vl_engine(args):
     from qwen_vl_utils import process_vision_info
     from transformers import AutoProcessor, Qwen2VLForConditionalGeneration
@@ -177,7 +172,6 @@ def build_qwen2_vl_engine(args):
                                                       -1).permute(1, 0, 2,
                                                                   3).unbind(0)
 
-            # Copied from transformers.models.llama.modeling_qwen2_vl in v4.48
             def rotate_half(x):
                 x1 = x[..., :x.shape[-1] // 2]
                 x2 = x[..., x.shape[-1] // 2:]
