@@ -17,7 +17,11 @@ myenv/
 _pytorch/
 
 # Allow tracking the specific Qwen2 model directory even though 'models/' is ignored
-!models/Qwen2-VL-2B-Instruct/
-!models/Qwen2-VL-2B-Instruct/**
+# !models/Qwen2-VL-2B-Instruct/
+# !models/Qwen2-VL-2B-Instruct/**
 
 onnx_origin/
+
+# models/TinyLlama-1.1B-Chat-v1.0/
+# models/tllm_ckpts/
+# models/trt_engines/
