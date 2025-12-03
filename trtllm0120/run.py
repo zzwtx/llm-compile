@@ -12,14 +12,15 @@ import tensorrt_llm.profiler as profiler
 from tensorrt_llm import logger
 from transformers import (AutoConfig, AutoModelForCausalLM, AutoProcessor,
                           AutoTokenizer)
-from tensorrt_llm._utils import (mpi_rank, str_dtype_to_torch, str_dtype_to_trt,
+from _utils import (str_dtype_to_torch, str_dtype_to_trt,
                       supports_inflight_batching, torch_dtype_to_trt,
                       trt_dtype_to_torch)
+from tensorrt_llm._utils import mpi_rank
 
 from typing import Optional, Tuple
 import torch.nn.functional as F
 from tensorrt_llm.runtime.session import Session, TensorInfo
-from tensorrt_llm.runtime.model_runner import ModelRunner
+from model_runner import ModelRunner
 from PIL import Image, UnidentifiedImageError
 try:
     from tensorrt_llm.runtime.model_runner_cpp import ModelRunnerCpp
@@ -27,8 +28,8 @@ except Exception:
     ModelRunnerCpp = None
 
 from transformers import AutoConfig, AutoProcessor, AutoTokenizer
-from tensorrt_llm.functional import RopeEmbeddingUtils, RotaryScalingType
-from tensorrt_llm.layers import MropeParams
+from functional import RopeEmbeddingUtils, RotaryScalingType
+from attention import MropeParams
 import torch
 import os
 import json
@@ -49,6 +50,44 @@ if PYTHON_BINDINGS:
     from tensorrt_llm.runtime.model_runner_cpp import ModelRunnerCpp
 
 # from tensorrt_llm.runtime import MultimodalModelRunner
+
+def compute_rotary_pos_emb(grid_thw, hf_config, VisionRotaryEmbedding):
+    head_dim = hf_config.vision_config.embed_dim // hf_config.vision_config.num_heads
+    rotary_pos_emb_func = VisionRotaryEmbedding(head_dim // 2)
+    hf_config.vision_config.spatial_merge_size
+
+    def rot_pos_emb(grid_thw, rotary_pos_emb_func):
+        pos_ids = []
+        for t, h, w in grid_thw:
+            hpos_ids = torch.arange(h).unsqueeze(1).expand(-1, w)
+            hpos_ids = hpos_ids.reshape(
+                h // hf_config.vision_config.spatial_merge_size,
+                hf_config.vision_config.spatial_merge_size,
+                w // hf_config.vision_config.spatial_merge_size,
+                hf_config.vision_config.spatial_merge_size,
+            )
+            hpos_ids = hpos_ids.permute(0, 2, 1, 3)
+            hpos_ids = hpos_ids.flatten()
+
+            wpos_ids = torch.arange(w).unsqueeze(0).expand(h, -1)
+            wpos_ids = wpos_ids.reshape(
+                h // hf_config.vision_config.spatial_merge_size,
+                hf_config.vision_config.spatial_merge_size,
+                w // hf_config.vision_config.spatial_merge_size,
+                hf_config.vision_config.spatial_merge_size,
+            )
+            wpos_ids = wpos_ids.permute(0, 2, 1, 3)
+            wpos_ids = wpos_ids.flatten()
+            pos_ids.append(
+                torch.stack([hpos_ids, wpos_ids], dim=-1).repeat(t, 1))
+        pos_ids = torch.cat(pos_ids, dim=0)
+        max_grid_size = grid_thw[:, 1:].max()
+        rotary_pos_emb_full = rotary_pos_emb_func(max_grid_size)
+        rotary_pos_emb = rotary_pos_emb_full[pos_ids].flatten(1)
+        return rotary_pos_emb
+
+    rotary_pos_emb = rot_pos_emb(grid_thw, rotary_pos_emb_func)
+    return rotary_pos_emb
 
 class MultimodalModelRunner:
 
@@ -135,11 +174,11 @@ class MultimodalModelRunner:
                 self.session = 'python'
 
             # qwen2_vl requires cpp_llm_only session by design for this runner
-            if self.args.session != "cpp_llm_only":
-                logger.warning(
-                    "Qwen2-vl only support C++ session for now, fallback to C++ session."
-                )
-                self.args.session = "cpp_llm_only"
+            # if self.args.session != "cpp_llm_only":
+            #     logger.warning(
+            #         "Qwen2-vl only support C++ session for now, fallback to C++ session."
+            #     )
+            #     self.args.session = "cpp_llm_only"
 
             if args.session == 'cpp':
                 logger.warning(
@@ -227,7 +266,6 @@ class MultimodalModelRunner:
                     stream=self.stream,
                     enable_context_fmha_fp32_acc=self.args.
                     enable_context_fmha_fp32_acc,
-                    multi_block_mode=self.args.multi_block_mode,
                 )
                 self.model_config = self.model.session._model_config
             elif self.cpp_e2e:
@@ -252,9 +290,9 @@ class MultimodalModelRunner:
                     enable_context_fmha_fp32_acc,
                     kv_cache_free_gpu_memory_fraction=self.args.
                     kv_cache_free_gpu_memory_fraction,
-                    cross_kv_cache_fraction=cross_kv_cache_fraction,
+                    # cross_kv_cache_fraction=cross_kv_cache_fraction,
                     multi_block_mode=self.args.multi_block_mode,
-                    mm_embedding_offloading=self.args.mm_embedding_offloading,
+                    # mm_embedding_offloading=self.args.mm_embedding_offloading,
                 )
                 self.model_config = self.model.model_config
             self.runtime_mapping = self.model.mapping
@@ -343,10 +381,39 @@ class MultimodalModelRunner:
         length = input_ids.shape[1]
         input_lengths = torch.IntTensor([length] * self.args.batch_size).to(
             torch.int32)
-        input_ids, ptuning_args, mrope_args = self.setup_fake_prompts_qwen2vl(
+        input_ids, ptuning_args, mrope_args, mrope_position_ids = self.setup_fake_prompts_qwen2vl(
             visual_features, input_ids, image_grid_thw, attention_mask,
             input_lengths)
-        return input_ids, input_lengths, ptuning_args, visual_features, mrope_args
+        
+        # Flatten position_ids if needed (for remove_input_padding)
+        # mrope_position_ids is [batch, 3, seq] (transposed in setup_fake_prompts)
+        # We need [3, num_tokens]
+        # attention_mask is [batch, seq]
+        # Note: input_ids was modified to include fake prompts, but attention_mask might not have been updated?
+        # Wait, setup_fake_prompts modifies input_ids in place or returns new one?
+        # It returns new input_ids.
+        # Does attention_mask match the new input_ids?
+        # In setup_fake_prompts, input_ids is modified by inserting fake prompts.
+        # But attention_mask is passed in.
+        # If input_ids length changed, attention_mask is invalid!
+        # Let's check setup_fake_prompts.
+        # It replaces tokens in input_ids with fake prompt IDs. It does NOT change length.
+        # "input_ids[masks] = values[masks]" -> In-place modification of values, shape preserved.
+        # So attention_mask is still valid.
+        
+        # Permute to [3, batch, seq]
+        mrope_position_ids = mrope_position_ids.permute(1, 0, 2)
+        # Flatten using attention_mask
+        # We need to broadcast attention_mask to [3, batch, seq]
+        # attention_mask is [batch, seq]
+        # mask = attention_mask.unsqueeze(0).expand(3, -1, -1)
+        # flat_position_ids = mrope_position_ids[mask.bool()].view(3, -1)
+        # Wait, boolean indexing flattens.
+        # mrope_position_ids[:, attention_mask.bool()] should work and return [3, num_tokens]
+        
+        position_ids = mrope_position_ids[:, attention_mask.bool().to(mrope_position_ids.device)]
+        
+        return input_ids, input_lengths, ptuning_args, visual_features, mrope_args, position_ids
 
     @staticmethod
     def tokenizer_image_token(batch_size,
@@ -434,7 +501,7 @@ class MultimodalModelRunner:
         profiler.start("Generate")
         profiler.start("Preprocess")
         # qwen2_vl preprocessing (always executed)
-        input_ids, input_lengths, ptuning_args, visual_features, mrope_args = self.preprocess(
+        input_ids, input_lengths, ptuning_args, visual_features, mrope_args, position_ids = self.preprocess(
             pre_prompt, post_prompt, image, other_vision_inputs,
             other_audio_inputs)
         mrope_params = MropeParams(
@@ -442,6 +509,22 @@ class MultimodalModelRunner:
             mrope_position_deltas=mrope_args[1],
         )
         profiler.stop("Preprocess")
+
+        print(f"DEBUG: position_ids type: {type(position_ids)}")
+        if isinstance(position_ids, torch.Tensor):
+            print(f"DEBUG: position_ids shape: {position_ids.shape}")
+        elif isinstance(position_ids, list):
+            print(f"DEBUG: position_ids list len: {len(position_ids)}")
+            if len(position_ids) > 0:
+                print(f"DEBUG: position_ids[0] shape: {position_ids[0].shape}")
+        
+        print(f"DEBUG: input_ids type: {type(input_ids)}")
+        if isinstance(input_ids, torch.Tensor):
+            print(f"DEBUG: input_ids shape: {input_ids.shape}")
+            # Print sample position_ids to verify they are not all zeros and have 3D structure
+            if isinstance(position_ids, torch.Tensor):
+                print(f"DEBUG: position_ids sample (first 5 cols):\n{position_ids[:, :5]}")
+                print(f"DEBUG: position_ids max values: {position_ids.max(dim=1)[0]}")
 
         # use prompt tuning to pass multimodal features
         # model.generate() expects the following params (see layers/embedding.py):
@@ -466,6 +549,7 @@ class MultimodalModelRunner:
 
             streaming_result = self.model.generate(
                 input_ids,
+                position_ids=position_ids,
                 mrope_params=mrope_params,
                 sampling_config=None,
                 prompt_table=prompt_table,
@@ -882,8 +966,19 @@ class MultimodalModelRunner:
         concat_cos_sin = torch.concatenate((cos, sin), axis=-1)
         concat_cos_sin = concat_cos_sin.reshape(concat_cos_sin.shape[0], -1)
 
-        mrope_args = [concat_cos_sin, mrope_position_deltas]
-        return input_ids, ptuning_args, mrope_args
+        # Pass the base table (self.rotary_cos_sin) instead of the processed one (concat_cos_sin)
+        # because attention.py logic expects the base table to perform lookup with position_ids.
+        # mrope_args = [concat_cos_sin, mrope_position_deltas]
+        
+        # Flatten to [1, max_pos * head_dim] to match engine expectation [1, 4194304]
+        rotary_cos_sin_flat = self.rotary_cos_sin.view(1, -1)
+        mrope_args = [rotary_cos_sin_flat, mrope_position_deltas]
+        # mrope_position_ids was transposed to [batch, 3, seq] at line 938?
+        # Line 938: mrope_position_ids = mrope_position_ids.transpose(1, 0)
+        # Original get_rope_index returns [3, batch, seq].
+        # So now it is [batch, 3, seq].
+        # We want to return it.
+        return input_ids, ptuning_args, mrope_args, mrope_position_ids
 
     def ptuning_setup(self, prompt_table, input_ids, input_lengths):
         hidden_size = self.model_config.hidden_size * self.runtime_mapping.tp_size
@@ -1016,7 +1111,7 @@ class MultimodalModelRunner:
         return images
 
     def setup_inputs(self, input_text, raw_image, raw_audio=None):
-        from tensorrt_llm.tools.multimodal_builder import compute_rotary_pos_emb
+        # from tensorrt_llm.tools.multimodal_builder import compute_rotary_pos_emb
         other_vision_inputs = {}
         other_audio_inputs = {}
         other_decoder_inputs = {}
@@ -1187,8 +1282,7 @@ def print_result(model, input_text, output_text, args):
                     (msec_per_batch('Tokenizer decode')))
 
     logger.info("---------------------------------------------------------")
-
-
+    
 if __name__ == '__main__':
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
     parser = argparse.ArgumentParser()
@@ -1341,4 +1435,4 @@ if __name__ == '__main__':
         # Keep original per-run print of the last result for consistency
         # print_result(model, input_text, output_text, args)
 
-# TODO: raise error if VILA mode 1 with C++ runtime
+        # TODO: raise error if VILA mode 1 with C++ runtime

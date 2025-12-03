@@ -51,7 +51,7 @@ def add_multimodal_arguments(parser):
 	parser.add_argument('--model_path', type=str, default=None)
 	parser.add_argument('--onnx_path', type=str, default=None)
 	parser.add_argument('--output_dir', type=str, default=None)
-	parser.add_argument('--max_batch_size', type=int, default=4)
+	parser.add_argument('--max_batch_size', type=int, default=1)
 	parser.add_argument('--max_hw_dims', type=int, default=5184)
 	parser.add_argument('--min_hw_dims', type=int, default=128)
 	return parser
@@ -159,9 +159,13 @@ def build_trt_engine(model_type,
 	parser = trt.OnnxParser(network, logger)
 	with open(onnx_file, 'rb') as model:
 		if not parser.parse(model.read(), os.path.abspath(onnx_file)):
-			logger.log(trt.Logger.ERROR, "Failed parsing %s" % onnx_file)
-			for error in range(parser.num_errors):
-				logger.log(trt.Logger.ERROR, parser.get_error(error))
+			logger.log(trt.Logger.ERROR, f"Failed parsing {onnx_file}")
+			for i in range(parser.num_errors):
+				err = parser.get_error(i)
+				# 有些 TRTErr 对象有 desc 属性 — 安全地选择描述或字符串化
+				msg = getattr(err, "desc", None) or str(err)
+				# 还可以打印更多字段（如果存在）：err.node, err.file, err.line
+				logger.log(trt.Logger.ERROR, msg)
 		logger.log(trt.Logger.INFO, "Succeeded parsing %s" % onnx_file)
 
 	# 定义批处理大小的范围

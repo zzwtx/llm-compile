@@ -13,7 +13,8 @@ from tensorrt_llm import logger
 from transformers import (AutoConfig, AutoModelForCausalLM, AutoProcessor,
                           AutoTokenizer)
 from tensorrt_llm._utils import (mpi_rank, str_dtype_to_torch, str_dtype_to_trt,
-                      supports_inflight_batching, torch_dtype_to_trt,
+                    #   supports_inflight_batching,
+                      torch_dtype_to_trt,
                       trt_dtype_to_torch)
 
 from typing import Optional, Tuple
@@ -27,8 +28,8 @@ except Exception:
     ModelRunnerCpp = None
 
 from transformers import AutoConfig, AutoProcessor, AutoTokenizer
-from tensorrt_llm.functional import RopeEmbeddingUtils, RotaryScalingType
-from tensorrt_llm.layers import MropeParams
+from tensorrt_llm.functional import RopeEmbeddingUtils, RotaryScalingType, Tensor
+# from tensorrt_llm.layers import MropeParams
 import torch
 import os
 import json
@@ -49,6 +50,54 @@ if PYTHON_BINDINGS:
     from tensorrt_llm.runtime.model_runner_cpp import ModelRunnerCpp
 
 # from tensorrt_llm.runtime import MultimodalModelRunner
+
+class MropeParams:
+    def __init__(
+        self,
+        mrope_rotary_cos_sin: Tensor = None,
+        mrope_position_deltas: Tensor = None,
+    ):
+        self.mrope_rotary_cos_sin = mrope_rotary_cos_sin
+        self.mrope_position_deltas = mrope_position_deltas
+
+def compute_rotary_pos_emb(grid_thw, hf_config, VisionRotaryEmbedding):
+    head_dim = hf_config.vision_config.embed_dim // hf_config.vision_config.num_heads
+    rotary_pos_emb_func = VisionRotaryEmbedding(head_dim // 2)
+    hf_config.vision_config.spatial_merge_size
+
+    def rot_pos_emb(grid_thw, rotary_pos_emb_func):
+        pos_ids = []
+        for t, h, w in grid_thw:
+            hpos_ids = torch.arange(h).unsqueeze(1).expand(-1, w)
+            hpos_ids = hpos_ids.reshape(
+                h // hf_config.vision_config.spatial_merge_size,
+                hf_config.vision_config.spatial_merge_size,
+                w // hf_config.vision_config.spatial_merge_size,
+                hf_config.vision_config.spatial_merge_size,
+            )
+            hpos_ids = hpos_ids.permute(0, 2, 1, 3)
+            hpos_ids = hpos_ids.flatten()
+
+            wpos_ids = torch.arange(w).unsqueeze(0).expand(h, -1)
+            wpos_ids = wpos_ids.reshape(
+                h // hf_config.vision_config.spatial_merge_size,
+                hf_config.vision_config.spatial_merge_size,
+                w // hf_config.vision_config.spatial_merge_size,
+                hf_config.vision_config.spatial_merge_size,
+            )
+            wpos_ids = wpos_ids.permute(0, 2, 1, 3)
+            wpos_ids = wpos_ids.flatten()
+            pos_ids.append(
+                torch.stack([hpos_ids, wpos_ids], dim=-1).repeat(t, 1))
+        pos_ids = torch.cat(pos_ids, dim=0)
+        max_grid_size = grid_thw[:, 1:].max()
+        rotary_pos_emb_full = rotary_pos_emb_func(max_grid_size)
+        rotary_pos_emb = rotary_pos_emb_full[pos_ids].flatten(1)
+        return rotary_pos_emb
+
+    rotary_pos_emb = rot_pos_emb(grid_thw, rotary_pos_emb_func)
+    return rotary_pos_emb
+
 
 class MultimodalModelRunner:
 
@@ -115,11 +164,11 @@ class MultimodalModelRunner:
             self.visual_output_shape = config['builder_config'].get(
                 'output_shape', None)
         if self.decoder_llm:
-            if not supports_inflight_batching(self.llm_engine_dir):
-                logger.warning(
-                    "The given engine does not support in-flight batching, both visual engine and LLM fallback to python session"
-                )
-                self.session = 'python'
+            # if not supports_inflight_batching(self.llm_engine_dir):
+            #     logger.warning(
+            #         "The given engine does not support in-flight batching, both visual engine and LLM fallback to python session"
+            #     )
+            #     self.session = 'python'
 
             if not PYTHON_BINDINGS and 'cpp' in args.session:
                 logger.warning(
@@ -252,9 +301,9 @@ class MultimodalModelRunner:
                     enable_context_fmha_fp32_acc,
                     kv_cache_free_gpu_memory_fraction=self.args.
                     kv_cache_free_gpu_memory_fraction,
-                    cross_kv_cache_fraction=cross_kv_cache_fraction,
+                    # cross_kv_cache_fraction=cross_kv_cache_fraction,
                     multi_block_mode=self.args.multi_block_mode,
-                    mm_embedding_offloading=self.args.mm_embedding_offloading,
+                    # mm_embedding_offloading=self.args.mm_embedding_offloading,
                 )
                 self.model_config = self.model.model_config
             self.runtime_mapping = self.model.mapping
@@ -434,13 +483,21 @@ class MultimodalModelRunner:
         profiler.start("Generate")
         profiler.start("Preprocess")
         # qwen2_vl preprocessing (always executed)
-        input_ids, input_lengths, ptuning_args, visual_features, mrope_args = self.preprocess(
-            pre_prompt, post_prompt, image, other_vision_inputs,
-            other_audio_inputs)
-        mrope_params = MropeParams(
-            mrope_rotary_cos_sin=mrope_args[0],
-            mrope_position_deltas=mrope_args[1],
-        )
+        
+        other_vision_inputs={}
+        
+        # input_ids, input_lengths, ptuning_args, visual_features, mrope_args = self.preprocess(
+        #     pre_prompt, post_prompt, image, other_vision_inputs,
+        #     other_audio_inputs)
+        input_ids = image['input_ids']
+        input_lengths = torch.IntTensor([0] * self.args.batch_size).to(
+            torch.int32)
+        ptuning_args=None
+        
+        # mrope_params = MropeParams(
+        #     mrope_rotary_cos_sin=mrope_args[0],
+        #     mrope_position_deltas=mrope_args[1],
+        # )
         profiler.stop("Preprocess")
 
         # use prompt tuning to pass multimodal features
@@ -460,13 +517,13 @@ class MultimodalModelRunner:
                 batch_size = len(input_ids)
                 prompt_tasks = ",".join(
                     np.arange(batch_size, dtype=np.int32).astype(str))
-                prompt_table = torch.stack([ptuning_args[0]])
-                prompt_table = prompt_table.view(batch_size, -1,
-                                                 prompt_table.shape[-1])
+                # prompt_table = torch.stack([ptuning_args[0]])
+                # prompt_table = prompt_table.view(batch_size, -1,
+                #                                  prompt_table.shape[-1])
 
             streaming_result = self.model.generate(
                 input_ids,
-                mrope_params=mrope_params,
+                # mrope_params=mrope_params,
                 sampling_config=None,
                 prompt_table=prompt_table,
                 prompt_tasks=prompt_tasks,
@@ -851,7 +908,7 @@ class MultimodalModelRunner:
                 num_pos=self.max_position_embeddings,
                 dim=int(self.hidden_size / self.num_attention_heads),
                 theta=float(self.rope_theta),
-                scale_type=RotaryScalingType.mrope)
+                scale_type=RotaryScalingType.none)
             self.rotary_cos_sin = torch.from_numpy(rotary_cos_sin).to(
                 visual_features.device)
             self.rotary_cos_sin = self.rotary_cos_sin.reshape(
@@ -1016,7 +1073,7 @@ class MultimodalModelRunner:
         return images
 
     def setup_inputs(self, input_text, raw_image, raw_audio=None):
-        from tensorrt_llm.tools.multimodal_builder import compute_rotary_pos_emb
+        # from tensorrt_llm.tools.multimodal_builder import compute_rotary_pos_emb
         other_vision_inputs = {}
         other_audio_inputs = {}
         other_decoder_inputs = {}
@@ -1025,6 +1082,10 @@ class MultimodalModelRunner:
             from transformers.models.qwen2_vl.modeling_qwen2_vl import \
                 VisionRotaryEmbedding
             hf_config = AutoConfig.from_pretrained(self.args.hf_model_dir)
+            # print(f"hf_config.rope_scaling {hf_config.rope_scaling['type']}")
+            # if hasattr(hf_config, 'rope_scaling') and hf_config.rope_scaling:
+            #     hf_config.rope_scaling["type"] = "default"
+            # del hf_config['rope_scaling']
             if input_text is None:
                 input_text = ["Question: Describe this image. Answer:"
                               ] * self.args.batch_size
@@ -1295,7 +1356,7 @@ if __name__ == '__main__':
                 llm_elapsed = llm_end - llm_start
             first_token_time = streaming_metrics.get("first_token_time")
             if first_token_time is not None and llm_start is not None:
-                ttft_value = v + max(first_token_time - llm_start, 0.0)
+                ttft_value = 0 if v is None else v + max(first_token_time - llm_start, 0.0)
                 if llm_end is not None and llm_end > first_token_time and tok_count > 0:
                     throughput_value = tok_count / max(llm_end - first_token_time, 1e-9)
 
