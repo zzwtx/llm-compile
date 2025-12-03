@@ -1222,7 +1222,7 @@ class Attention(Module):
                     c1_parts = split(c1, [16, 24, 24], dim=-1)
                     c2_parts = split(c2, [16, 24, 24], dim=-1)
                     
-                    cos_final = concat([c0_parts[0], c1_parts[1], c2_parts[2]], dim=-1)
+                    # cos_final = concat([c0_parts[0], c1_parts[1], c2_parts[2]], dim=-1)
                     
                     s0, s1, s2 = split(sin, [1, 1, 1], dim=-2)
                     s0 = squeeze(s0, -2)
@@ -1233,14 +1233,24 @@ class Attention(Module):
                     s1_parts = split(s1, [16, 24, 24], dim=-1)
                     s2_parts = split(s2, [16, 24, 24], dim=-1)
                     
-                    sin_final = concat([s0_parts[0], s1_parts[1], s2_parts[2]], dim=-1)
+                    # sin_final = concat([s0_parts[0], s1_parts[1], s2_parts[2]], dim=-1)
                     
                     # Expand to match head_size (128) by repeating for pairs
                     # Standard RoPE rotate_half assumes [-x2, x1] layout (half-half), so cos/sin should be duplicated (concat), not interleaved.
-                    # cos = repeat_interleave(cos_final, 2, dim=-1)
-                    # sin = repeat_interleave(sin_final, 2, dim=-1)
-                    cos = concat([cos_final, cos_final], dim=-1)
-                    sin = concat([sin_final, sin_final], dim=-1)
+                    # However, mrope_rotate_half splits the tensor into sections [32, 48, 48] and rotates each section.
+                    # So we must construct cos/sin to match this structure: [sec0, sec0, sec1, sec1, sec2, sec2].
+                    
+                    cos = concat([
+                        c0_parts[0], c0_parts[0],
+                        c1_parts[1], c1_parts[1],
+                        c2_parts[2], c2_parts[2]
+                    ], dim=-1)
+                    
+                    sin = concat([
+                        s0_parts[0], s0_parts[0],
+                        s1_parts[1], s1_parts[1],
+                        s2_parts[2], s2_parts[2]
+                    ], dim=-1)
                     
                     # 4. Broadcast Cos/Sin to match Q/K heads
                     # Expand for heads

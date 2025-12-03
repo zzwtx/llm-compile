@@ -510,22 +510,6 @@ class MultimodalModelRunner:
         )
         profiler.stop("Preprocess")
 
-        print(f"DEBUG: position_ids type: {type(position_ids)}")
-        if isinstance(position_ids, torch.Tensor):
-            print(f"DEBUG: position_ids shape: {position_ids.shape}")
-        elif isinstance(position_ids, list):
-            print(f"DEBUG: position_ids list len: {len(position_ids)}")
-            if len(position_ids) > 0:
-                print(f"DEBUG: position_ids[0] shape: {position_ids[0].shape}")
-        
-        print(f"DEBUG: input_ids type: {type(input_ids)}")
-        if isinstance(input_ids, torch.Tensor):
-            print(f"DEBUG: input_ids shape: {input_ids.shape}")
-            # Print sample position_ids to verify they are not all zeros and have 3D structure
-            if isinstance(position_ids, torch.Tensor):
-                print(f"DEBUG: position_ids sample (first 5 cols):\n{position_ids[:, :5]}")
-                print(f"DEBUG: position_ids max values: {position_ids.max(dim=1)[0]}")
-
         # use prompt tuning to pass multimodal features
         # model.generate() expects the following params (see layers/embedding.py):
         # args[0]: prompt embedding table, [batch_size, multimodal_len, hidden_size], later flattened to [batch_size * multimodal_len, hidden_size]
@@ -536,6 +520,11 @@ class MultimodalModelRunner:
         streaming_result = None
         if self.decoder_llm:
             end_id = self.tokenizer.eos_token_id
+            # Check if we should use im_end for chat models
+            if hasattr(self.tokenizer, "convert_tokens_to_ids"):
+                 im_end_id = self.tokenizer.convert_tokens_to_ids("<|im_end|>")
+                 if im_end_id is not None and im_end_id != self.tokenizer.unk_token_id:
+                     end_id = im_end_id
 
             prompt_tasks = None
             prompt_table = None
@@ -546,6 +535,11 @@ class MultimodalModelRunner:
                 prompt_table = torch.stack([ptuning_args[0]])
                 prompt_table = prompt_table.view(batch_size, -1,
                                                  prompt_table.shape[-1])
+
+            # Adjust repetition penalty if default
+            repetition_penalty = self.args.repetition_penalty
+            # if repetition_penalty == 1.0:
+            #     repetition_penalty = 1.05
 
             streaming_result = self.model.generate(
                 input_ids,
@@ -562,7 +556,7 @@ class MultimodalModelRunner:
                 top_k=self.args.top_k,
                 top_p=self.args.top_p,
                 temperature=self.args.temperature,
-                repetition_penalty=self.args.repetition_penalty,
+                repetition_penalty=repetition_penalty,
                 num_beams=self.args.num_beams,
                 lora_uids=self.args.lora_task_uids,
                 output_sequence_lengths=False,
@@ -1121,7 +1115,7 @@ class MultimodalModelRunner:
                 VisionRotaryEmbedding
             hf_config = AutoConfig.from_pretrained(self.args.hf_model_dir)
             if input_text is None:
-                input_text = ["Question: Describe this image. Answer:"
+                input_text = ["Question: 请详尽地描述这张图片. Answer:"
                               ] * self.args.batch_size
             messages = [[{
                 "role":

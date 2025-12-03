@@ -356,22 +356,12 @@ class _Runtime(object):
             if name not in tensors:
                 continue
 
-            if name == 'input_ids':
-                print(f"DEBUG: _set_tensors input_ids shape: {tensors['input_ids'].shape}")
-            if name == 'host_request_types':
-                print(f"DEBUG: _set_tensors host_request_types shape: {tensors['host_request_types'].shape}")
-
-
             tensor = tensors[name]
             if context.get_tensor_address(name) != tensor.data:
                 context.set_tensor_address(name, tensor.data)
 
             if list(context.get_tensor_shape(name)) != tensor.shape:
                 context.set_input_shape(name, tensor.shape)
-                
-            if name == 'input_ids':
-                print(f"DEBUG: _set_tensors POST input_ids shape: {context.get_tensor_shape(name)}")
-                print(f"DEBUG: _set_tensors POST input_ids addr: {context.get_tensor_address(name)}")
 
         for name in self.output_tensor_names:
             if name not in tensors:
@@ -1858,14 +1848,11 @@ class GenerationSession(object):
             add_tensor(cache_indirection, 'cache_indirection')
 
             if self.has_position_embedding or mrope_position_deltas is not None:
-                print(f"DEBUG: Adding position_ids shape={position_ids.shape}")
                 add_tensor(position_ids, 'position_ids')
             
             if mrope_position_deltas is not None:
-                print(f"DEBUG: Adding mrope_position_deltas shape={mrope_position_deltas.shape}")
                 add_tensor(mrope_position_deltas, 'mrope_position_deltas')
             if mrope_rotary_cos_sin is not None:
-                print(f"DEBUG: Adding mrope_rotary_cos_sin shape={mrope_rotary_cos_sin.shape}")
                 add_tensor(mrope_rotary_cos_sin, 'mrope_rotary_cos_sin')
 
         if self.cross_attention:
@@ -1913,7 +1900,6 @@ class GenerationSession(object):
             add_tensor(hidden_states_input, 'hidden_states_output')
 
         if self.mapping.is_first_pp_rank():
-            print(f"DEBUG: _get_context_shape_buffer input_ids shape={input_ids.shape}")
             add_tensor(input_ids, 'input_ids')
         else:
             add_tensor(hidden_states_input, 'hidden_states_input')
@@ -2057,7 +2043,6 @@ class GenerationSession(object):
             add_tensor_with_shape(self.host_sink_token_length,
                                   'host_sink_token_length', (1, ))
             add_tensor(host_request_types, 'host_request_types')
-            print(f"DEBUG: _get_context_shape_buffer host_request_types={host_request_types}")
             add_tensor_with_shape(self.host_max_attention_window_sizes,
                                   f'host_max_attention_window_sizes',
                                   (self.num_attn_layers, ))
@@ -2148,14 +2133,11 @@ class GenerationSession(object):
                 add_tensor(host_runtime_perf_knobs, 'host_runtime_perf_knobs')
             add_tensor(cache_indirection, 'cache_indirection')
             if self.has_position_embedding:
-                print(f"DEBUG: _get_next_step_shape_buffer position_ids shape={position_ids.shape}")
                 add_tensor(position_ids, 'position_ids')
 
             if mrope_position_deltas is not None:
-                print(f"DEBUG: _get_next_step_shape_buffer mrope_position_deltas shape={mrope_position_deltas.shape}")
                 add_tensor(mrope_position_deltas, 'mrope_position_deltas')
             if mrope_rotary_cos_sin is not None:
-                print(f"DEBUG: _get_next_step_shape_buffer mrope_rotary_cos_sin shape={mrope_rotary_cos_sin.shape}")
                 add_tensor(mrope_rotary_cos_sin, 'mrope_rotary_cos_sin')
 
         if self.mapping.has_pp():
@@ -2183,7 +2165,6 @@ class GenerationSession(object):
                     batch_size * beam_width * (self.num_draft_tokens + 1),
                 ) if self.remove_input_padding else (batch_size * beam_width,
                                                      self.num_draft_tokens + 1)
-            print(f"DEBUG: _get_next_step_shape_buffer input_ids_shape={input_ids_shape}")
             if self.is_redrafter_mode:
                 add_tensor_with_shape(self.buffer['flat_tokens'], 'input_ids',
                                       input_ids_shape)
@@ -2191,7 +2172,6 @@ class GenerationSession(object):
                 add_tensor_with_shape(self.generation_input_ids, 'input_ids',
                                       input_ids_shape)
             else:
-                print(f"DEBUG: Setting input_ids to self.new_tokens shape={self.new_tokens.shape}")
                 add_tensor_with_shape(self.new_tokens, 'input_ids',
                                       input_ids_shape)
         else:
@@ -2257,8 +2237,10 @@ class GenerationSession(object):
             add_tensor(prompt_embedding_table, 'prompt_embedding_table')
 
             if self.remove_input_padding:
+                # In generation phase, we only have 1 token per sequence
                 gen_tasks = torch.concat([
-                    torch.full([context_lengths[b].item()],
+                    # torch.full([context_lengths[b].item()],
+                    torch.full([1],
                                tasks[b].item(),
                                dtype=torch.int32)
                     for b in range(context_lengths.size(0))
@@ -2350,7 +2332,6 @@ class GenerationSession(object):
             # generation requests
             host_request_types = torch.ones_like(context_lengths,
                                                  device='cpu').int()
-            print(f"DEBUG: _get_next_step_shape_buffer host_request_types={host_request_types}")
             if self.is_redrafter_mode:
                 torch.cuda.nvtx.range_push("device_request_types")
                 device_request_types = torch.ones_like(
@@ -2538,14 +2519,26 @@ class GenerationSession(object):
 
                 torch.cuda.nvtx.range_pop()
             else:
-                position_ids = context_lengths + step
-                if mrope_params is not None:
-                    position_ids = position_ids.unsqueeze(0).expand(3, -1)
+                if mrope_params is not None and hasattr(self, 'mrope_next_pos'):
+                    position_ids = self.mrope_next_pos + step
                     if not remove_input_padding:
                         position_ids = position_ids.unsqueeze(-1)
                     ret['mrope_rotary_cos_sin'] = mrope_params.mrope_rotary_cos_sin
-                    ret['mrope_position_deltas'] = mrope_params.mrope_position_deltas
-                elif not remove_input_padding:
+                    # For text generation, mRoPE position delta should be 0
+                    ret['mrope_position_deltas'] = torch.zeros_like(mrope_params.mrope_position_deltas)
+                else:
+                    position_ids = context_lengths + step
+                    if mrope_params is not None:
+                        position_ids = position_ids.unsqueeze(0).expand(3, -1)
+                        if not remove_input_padding:
+                            position_ids = position_ids.unsqueeze(-1)
+                        ret['mrope_rotary_cos_sin'] = mrope_params.mrope_rotary_cos_sin
+                        # For text generation, mRoPE position delta should be 0
+                        # ret['mrope_position_deltas'] = torch.zeros_like(mrope_params.mrope_position_deltas)
+                        ret['mrope_position_deltas'] = mrope_params.mrope_position_deltas
+
+                
+                if not remove_input_padding and mrope_params is None:
                     position_ids = torch.unsqueeze(position_ids, 1)
 
             perf_knob_tensor_size = 16
@@ -3023,10 +3016,6 @@ class GenerationSession(object):
             next_src_cache_indirection = cache_indirections[1]
 
         if step == 0:
-            print(f"DEBUG: handle_per_step calling _prepare_context_inputs with kwargs keys: {list(kwargs.keys())}")
-            if 'position_ids' in kwargs:
-                print(f"DEBUG: handle_per_step kwargs['position_ids'] shape: {kwargs['position_ids'].shape}")
-
             # Filter kwargs to avoid multiple values for arguments explicitly passed to _prepare_context_inputs
             kwargs_for_prepare = kwargs.copy()
             keys_to_remove = ['max_context_length', 'input_ids', 'pad_id', 'eos_id']
@@ -3046,6 +3035,20 @@ class GenerationSession(object):
                 **kwargs_for_prepare)
 
             position_ids = model_inputs.get('position_ids', None)
+
+            # Capture mRoPE start position for generation
+            if position_ids is not None and kwargs.get('mrope_params', None) is not None:
+                if self.remove_input_padding:
+                    self.mrope_next_pos = torch.zeros((3, batch_size), dtype=position_ids.dtype, device=position_ids.device)
+                    current_offset = 0
+                    for i in range(batch_size):
+                        length = context_lengths[i].item()
+                        seq_pos_ids = position_ids[:, current_offset : current_offset + length]
+                        self.mrope_next_pos[:, i] = seq_pos_ids.max(dim=1).values + 1
+                        current_offset += length
+                else:
+                    self.mrope_next_pos = position_ids.max(dim=-1).values + 1
+
             last_token_ids = model_inputs.get('last_token_ids')
             attention_mask = model_inputs.get('attention_mask', None)
             context_runtime_perf_knobs = model_inputs.get(
@@ -3062,14 +3065,16 @@ class GenerationSession(object):
                         'cuda')
 
             mrope_params = kwargs.get('mrope_params', None)
-            print(f"DEBUG: handle_per_step step={step} mrope_params={mrope_params}")
             mrope_position_deltas = None
             mrope_rotary_cos_sin = None
             if mrope_params is not None:
                 mrope_position_deltas = mrope_params.mrope_position_deltas
+                # Force mrope_position_deltas to 0 to ensure consistent 0-based indexing for mRoPE
+                # when using compressed position_ids (0..46).
+                # if mrope_params.mrope_position_deltas is not None:
+                #     mrope_position_deltas = torch.zeros_like(mrope_params.mrope_position_deltas)
+                
                 mrope_rotary_cos_sin = mrope_params.mrope_rotary_cos_sin
-                print(f"DEBUG: mrope_position_deltas shape={mrope_position_deltas.shape if mrope_position_deltas is not None else None}")
-                print(f"DEBUG: mrope_rotary_cos_sin shape={mrope_rotary_cos_sin.shape if mrope_rotary_cos_sin is not None else None}")
 
             ctx_tensors = self._get_context_shape_buffer(
                 input_ids,
@@ -3225,6 +3230,8 @@ class GenerationSession(object):
             attention_mask = model_inputs.get('attention_mask', None)
             gen_runtime_perf_knobs = model_inputs.get('host_runtime_perf_knobs',
                                                       None)
+            
+            # temdel
             mrope_rotary_cos_sin = model_inputs.get('mrope_rotary_cos_sin', None)
             mrope_position_deltas = model_inputs.get('mrope_position_deltas', None)
 
@@ -3298,6 +3305,7 @@ class GenerationSession(object):
             # needs to pro-long the life time of the tensors inside the next_step_tensors array
             # otherwise, it maybe released before the next step actually enqueued
             # one way to prolong it is to return the list, and destroy it in next step by assigning new values
+            
             torch.cuda.nvtx.range_push("_set_tensors")
             self.runtime._set_tensors(next_context, next_step_tensors)
             torch.cuda.nvtx.range_pop()
@@ -3332,6 +3340,26 @@ class GenerationSession(object):
                                                   logits)
                         self.buffer['logits'] = logits
                     # [batch_size x beam_width, vocab_size_padded] -> [batch_size, beam_width, vocab_size_padded]
+                    
+                    # Debug: Print top logits at step 0
+                    if step == 0:
+                        probs = torch.softmax(logits, dim=-1)
+                        top_probs, top_ids = torch.topk(probs, 5, dim=-1)
+                        print(f"Step {step} Top 5 tokens: {top_ids} Probs: {top_probs}")
+                        if self.end_ids is not None:
+                            print(f"End IDs: {self.end_ids}")
+
+                    # Restore ORIGINAL masking (Always mask end_ids)
+                    if self.end_ids is not None:
+                        flat_logits = logits.view(-1, logits.shape[-1])
+                        if isinstance(self.end_ids, torch.Tensor):
+                            flat_end_ids = self.end_ids.flatten()
+                        else:
+                            flat_end_ids = torch.tensor(self.end_ids,
+                                                        device=flat_logits.device,
+                                                        dtype=torch.int32).flatten()
+                        flat_logits[..., flat_end_ids] = -float('inf')
+
                     next_token_logits = logits.reshape(
                         (batch_size, beam_width,
                          -1)).to(self.decoder_logits_dtype)
